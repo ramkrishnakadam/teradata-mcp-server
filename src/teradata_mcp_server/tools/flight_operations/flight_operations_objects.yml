@@ -1,0 +1,43 @@
+CERT_flight_operations_vws:
+  type: tool
+  description: "Provides access to flight operations and employee data for American Airlines, including flight status, delays, baggage, and delay reasons, based on mcp_flight_ops_queries_and_prompt.md."
+  python_handler: "CERT_flight_operations_vws"
+  parameters:
+    get_flight_status:
+      description: "Get status of a specific flight on a given date."
+      parameters:
+        flight_number: {type: string, description: "Flight number"}
+        The status of flight 121 on August 24, 2025 (last week Sunday), including departure/arrival times and delays.: {type: string, description: "Flight date (YYYY-MM-DD)"}
+    get_bag_status:
+      description: "Get number of missing or delayed bags for a given date."
+      parameters:
+        flight_date: {type: string, description: "Flight date (YYYY-MM-DD)"}
+    get_delayed_flights_count:
+      description: "Get number of delayed flights on a specific date."
+      parameters:
+        flight_date: {type: string, description: "Flight date (YYYY-MM-DD)"}
+    get_total_flights_count:
+      description: "Get total number of flights flown on a specific date."
+      parameters:
+        flight_date: {type: string, description: "Flight date (YYYY-MM-DD)"}
+    get_delay_buckets:
+      description: "Get delayed flights by delay duration buckets for a specific date."
+      parameters:
+        flight_date: {type: string, description: "Flight date (YYYY-MM-DD)"}
+    get_most_delayed_flight:
+      description: "Get the flight with the highest delay on a specific date."
+      parameters:
+        flight_date: {type: string, description: "Flight date (YYYY-MM-DD)"}
+    get_flight_details:
+      description: "Get details for a specific flight, airline, and date."
+      parameters:
+        flight_number: {type: string, description: "Flight number"}
+        airline_code: {type: string, description: "Airline IATA code"}
+        flight_date: {type: string, description: "Flight date (YYYY-MM-DD)"}
+    get_delays_by_reason:
+      description: "Get delayed flights categorized by delay reason code for a specific date."
+      parameters:
+        flight_date: {type: string, description: "Flight date (YYYY-MM-DD)"}
+    get_delay_reason_xref:
+      description: "Get all delay reason code explanations."
+      parameters: {}

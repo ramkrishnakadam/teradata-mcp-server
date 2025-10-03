@@ -1,0 +1,86 @@
+
+ci_customer_value_segmentation:
+  type: tool
+  description: "Identify high-value customers by ICC margin, segment by tier, tenure, or home city."
+  python_handler: "ci_ai_analyst_tools.handle_ci_customer_value_segmentation"
+  parameters: {}
+
+ci_app_usage:
+  type: tool
+  description: "Analyze the impact of app usage on revenue and loyalty."
+  python_handler: "ci_ai_analyst_tools.handle_ci_app_usage"
+  parameters: {}
+
+ci_cobrand_card_analysis:
+  type: tool
+  description: "Compare spend, ICC, and ancillary revenue by co-brand card type."
+  python_handler: "ci_ai_analyst_tools.handle_ci_cobrand_card_analysis"
+  parameters: {}
+
+ci_share_of_wallet:
+  type: tool
+  description: "Identify customers with low AA share of wallet for targeted campaigns."
+  python_handler: "ci_ai_analyst_tools.handle_ci_share_of_wallet"
+  parameters: {}
+
+ci_breakage_credit_utilization:
+  type: tool
+  description: "Quantify breakage revenue and identify customers with high unused credits."
+  python_handler: "ci_ai_analyst_tools.handle_ci_breakage_credit_utilization"
+  parameters: {}
+
+ci_campaign_impact:
+  type: tool
+  description: "Measure conversion rates and revenue lift from Boost & Renew or status match campaigns."
+  python_handler: "ci_ai_analyst_tools.handle_ci_campaign_impact"
+  parameters: {}
+
+ci_loyalty_churn:
+  type: tool
+  description: "Identify customers at risk of churn and recommend retention actions."
+  python_handler: "ci_ai_analyst_tools.handle_ci_loyalty_churn"
+  parameters: {}
+
+ci_ancillary_product:
+  type: tool
+  description: "Analyze ancillary revenue by product and customer segment."
+  python_handler: "ci_ai_analyst_tools.handle_ci_ancillary_product"
+  parameters: {}
+
+ci_booking_channel:
+  type: tool
+  description: "Track booking channel shifts and digital adoption."
+  python_handler: "ci_ai_analyst_tools.handle_ci_booking_channel"
+  parameters: {}
+
+ci_premium_customer:
+  type: tool
+  description: "Deep dive into AAdvantage Premium customer performance."
+  python_handler: "ci_ai_analyst_tools.handle_ci_premium_customer"
+  parameters: {}
+
+ci_companion_bag_benefits:
+  type: tool
+  description: "Evaluate usage and revenue impact of companion certificates and co-brand bag benefits."
+  python_handler: "ci_ai_analyst_tools.handle_ci_companion_bag_benefits"
+  parameters: {}
+
+ci_award_cpm:
+  type: tool
+  description: "Analyze the cost and value of award redemptions."
+  python_handler: "ci_ai_analyst_tools.handle_ci_award_cpm"
+  parameters: {}
+
+ci_ai_analyst_sql_examples:
+  type: tool
+  description: "Returns all CI 5.0 business scenario SQL examples and their scenario descriptions as a structured list."
+  python_handler: "ci_ai_analyst_tools.handle_ci_ai_analyst_sql_examples"
+  parameters: {}
+  usage_prompt: |
+    Prompt: Retrieve CI 5.0 Business Scenario SQL Examples
+    "Return a structured list of all business scenario SQL examples and their scenario descriptions from the CI 5.0 Customer Intelligence Analyst documentation. Each entry should include the scenario name, a brief description, and the associated SQL query."
+ci_ai_analyst_reference:
+  type: tool
+  description: "Returns CI 5.0 Customer Intelligence Data Analyst reference, including core datasets, terminology, and physical mappings."
+  python_handler: "ci_ai_analyst_tools.handle_ci_ai_analyst_reference"
+  parameters: {}

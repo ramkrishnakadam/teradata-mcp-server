@@ -414,3 +414,90 @@ def handle_dba_tableUsageImpact(conn: TeradataConnection, database_name: str | N
     }
     logger.debug(f"Tool: handle_dba_tableUsageImpact: metadata: {metadata}")
     return create_response(data, metadata)
+
+#------------------ Tool  ------------------#
+# Teradata System Analysis Tool
+def handle_teradata_system_analysis(conn: TeradataConnection, startdate: str, enddate: str, *args, **kwargs):
+    """
+    Analyze Teradata system usage based on workload types, user activity, and resource consumption.
+
+    Arguments:
+      startdate - Start date for the analysis (YYYY-MM-DD).
+      enddate - End date for the analysis (YYYY-MM-DD).
+
+    Returns:
+      ResponseType: formatted response with query results + metadata
+    """
+    logger.debug(f"Tool: handle_teradata_system_analysis: Args: startdate: {startdate}, enddate: {enddate}")
+
+    query = """
+    SEL 
+    CASE WHEN WDName IN ('Analytic_Medium') THEN 'Analytic'
+    WHEN WDName Like '%App%' THEN 'Application Users'
+    WHEN WDName like '%BATCH%' THEN 'Batch'
+    WHEN WDName IN ('EPNR-Long', 'EPNR-Short') THEN 'EPNR'
+    WHEN WDName IN ('NRT_High','NRT_Low') THEN  'NRT'
+    WHEN WDName IN ('QG_AP1','QG_AP2') THEN  'QG'
+    WHEN WDName IN ('Report_High','Report_Long','Report_Medium','Report_Top') THEN  'Report'
+    WHEN WDName IN ('Strategic') THEN  'Strategic'
+    WHEN WDName IN ('TRM_Offline') THEN  'TRM'
+    WHEN WDName Like '%user%' THEN  'Users'
+    WHEN WDName like any ('%Utilities%','%Utility%') THEN 'Utilities'
+    WHEN WDName IN ('WD-Sandbox','WD-DataLabs','WD-Sandbox-Short','WD-Sandbox-Tactical') THEN 'SandBox'
+    WHEN WDName like '%Celebrus%'  THEN 'Celebrus'
+    WHEN WDName IN ('WD_NOS') THEN  'NOS'
+    WHEN WDName IN ('WD-OneAmp') THEN 'One-AMP'
+    WHEN WDName IN ('WD-Default') THEN 'Default Workload User'
+    ELSE 'Other WD' END AS "Type Of User",
+
+    USERNAME,
+    Logdate, 
+    WDName,
+
+    CASE WHEN day_of_week = 1 THEN 'Sunday'
+    WHEN day_of_week = 2 THEN 'Monday'
+    WHEN day_of_week = 3 THEN 'Tuesday'
+    WHEN day_of_week = 4 THEN 'Wednesday'
+    WHEN day_of_week = 5 THEN 'Thursday'
+    WHEN day_of_week = 6 THEN 'Friday'
+    WHEN day_of_week = 7 THEN 'Saturday'
+    END AS DayOfWeek,
+
+    CASE WHEN Extract(hour from starttime) between 0 and 4 THEN '1) 12-am-to-4-am'
+    When Extract(hour from starttime) between 5 and 12 THEN '2) 5-am-to-12-pm'
+    When Extract(hour from starttime) between 13 and 16 THEN '3) 1-pm-to-4-pm'
+    When Extract(hour from starttime) between 16 and 23 THEN '4) 4-pm-to-12-am'
+    Else '5) Off-Business Hours' END AS State_of_day,
+
+    CASE WHEN NumOFActiveAmps = 420 THEN 'All Amps' ELSE 'One Amps' END AS "Number Of Amps",
+    COUNT(*) AS Frequency,
+    SUM(AMPCPUTime) AS CPU,
+    SUM(NumOfActiveAmps * MaxAMPCPUTime) AS IMPACT,
+    SUM(TotalIOCount) AS IO
+
+    FROM PDCRINFO.DBQLogTbl_hst A INNER JOIN Sys_calendar.CALENDAR C
+
+    ON A.Logdate = C.Calendar_Date
+    Where day_of_week between 2 and 6
+    and logdate between :startdate and :enddate 
+    GROUP BY 1,2,3,4,5,6,7
+    ORDER BY 8 DESC;
+    """
+
+    with conn.cursor() as cur:
+        logger.debug("Executing Teradata system analysis query.")
+        rows = cur.execute(query, {'startdate': startdate, 'enddate': enddate})
+        data = rows_to_json(cur.description, rows.fetchall())
+
+    metadata = {
+        "tool_name": "teradata_system_analysis",
+        "startdate": startdate,
+        "enddate": enddate,
+        "total_rows": len(data)
+    }
+    logger.debug(f"Tool: handle_teradata_system_analysis: metadata: {metadata}")
+    return create_response(data, metadata)
+
+
+
+
