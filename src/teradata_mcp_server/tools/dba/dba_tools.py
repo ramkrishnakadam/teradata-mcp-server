@@ -1,358 +1,489 @@
 import logging
+import re
+import os
 
+from sqlalchemy import text
+from sqlalchemy.engine import Connection, default
 from teradatasql import TeradataConnection
 
 from teradata_mcp_server.tools.utils import create_response, rows_to_json
 
 logger = logging.getLogger("teradata_mcp_server")
 
-#------------------ Tool  ------------------#
-# Get table SQL tool
-def handle_dba_tableSqlList(conn: TeradataConnection, table_name: str, no_days: int | None = 7,  *args, **kwargs):
+
+class SQLValidationError(Exception):
+    """Raised when SQL query fails validation checks"""
+    pass
+
+
+def validate_sql(sql: str) -> None:
     """
-    Get a list of SQL run against a table in the last number of days.
+    Validate SQL query to prevent dangerous operations.
+    
+    Raises:
+        SQLValidationError: If the SQL contains prohibited operations
+    """
+    if not sql or not sql.strip():
+        raise SQLValidationError("Empty SQL query not allowed")
+    
+    # Convert to uppercase for case-insensitive matching
+    sql_upper = sql.upper().strip()
+    sql_normalized = re.sub(r'\s+', ' ', sql_upper)  # Normalize whitespace
+    
+    # Check if SQL validation is disabled via environment variable
+    if os.getenv("DISABLE_SQL_VALIDATION", "false").lower() == "true":
+        logger.warning("SQL validation is DISABLED - this is a security risk!")
+        return
+    
+    # Define dangerous operations that should be blocked
+    dangerous_keywords = [
+        'UPDATE', 'DELETE', 'INSERT', 'DROP', 'CREATE', 'ALTER', 'TRUNCATE', 
+        'MERGE', 'REPLACE', 'GRANT', 'REVOKE', 'CALL', 'EXECUTE'
+    ]
+    
+    # Check for dangerous keywords at statement boundaries
+    for keyword in dangerous_keywords:
+        # Look for keyword at start of statement or after semicolon
+        patterns = [
+            rf'^{keyword}\s',           # At start of query
+            rf';\s*{keyword}\s',        # After semicolon
+            rf'^{keyword}$',            # Standalone keyword
+            rf';\s*{keyword}$'          # After semicolon at end
+        ]
+        
+        for pattern in patterns:
+            if re.search(pattern, sql_normalized):
+                raise SQLValidationError(f"Operation '{keyword}' is not allowed for security reasons")
+    
+    # Block SELECT * without WHERE clause to prevent full table scans
+    # Allow exceptions for system tables and small utility queries
+    if re.search(r'^SELECT\s+\*\s+FROM', sql_normalized):
+        # Check if there's a WHERE clause
+        if not re.search(r'\bWHERE\b', sql_normalized):
+            # Allow exceptions for system catalogs and limited queries
+            system_table_patterns = [
+                r'FROM\s+DBC\.',           # DBC system tables
+                r'FROM\s+INFORMATION_SCHEMA\.',  # Information schema
+                r'TOP\s+\d+',              # Queries with TOP clause
+                r'SAMPLE\s+\d+',           # Queries with SAMPLE clause
+            ]
+            
+            is_system_query = any(re.search(pattern, sql_normalized) for pattern in system_table_patterns)
+            
+            if not is_system_query:
+                raise SQLValidationError(
+                    "SELECT * without WHERE clause is not allowed. "
+                    "Use specific columns or add a WHERE clause to limit results."
+                )
+    
+    # Block potentially dangerous functions
+    dangerous_functions = [
+        'EXEC', 'EXECUTE', 'SP_', 'XP_'  # Stored procedures
+    ]
+    
+    for func in dangerous_functions:
+        if re.search(rf'\b{func}\b', sql_normalized):
+            raise SQLValidationError(f"Function '{func}' is not allowed for security reasons")
+    
+    # Warn about queries that might return large result sets
+    large_result_indicators = [
+        r'SELECT\s+\*.*FROM.*(?!.*LIMIT|.*TOP|.*SAMPLE|.*WHERE)',
+        r'COUNT\(\*\).*FROM.*(?!.*WHERE)',
+    ]
+    
+    for pattern in large_result_indicators:
+        if re.search(pattern, sql_normalized):
+            logger.warning(f"Query may return large result set: {sql[:100]}...")
+    
+    logger.info(f"SQL validation passed for query: {sql[:100]}{'...' if len(sql) > 100 else ''}")
+
+#------------------ Tool  ------------------#
+# Read query tool
+def handle_base_readQuery(
+    conn: Connection,
+    sql: str | None = None,
+    tool_name: str | None = None,
+    *args,
+    **kwargs
+):
+    """
+    Execute a SQL query via SQLAlchemy, bind parameters if provided (prepared SQL), and return the fully rendered SQL (with literals) in metadata.
 
     Arguments:
+      sql    - SQL text, with optional bind-parameter placeholders
+
+    Returns:
+      ResponseType: formatted response with query results + metadata
+    """
+    logger.debug(f"Tool: handle_base_readQuery: Args: sql: {sql}, args={args!r}, kwargs={kwargs!r}")
+
+    # Validate SQL for security before execution
+    try:
+        validate_sql(sql)
+    except SQLValidationError as e:
+        logger.error(f"SQL validation failed: {e}")
+        return create_response(
+            [],
+            {
+                "tool_name": tool_name if tool_name else "base_readQuery",
+                "error": f"SQL validation failed: {str(e)}",
+                "sql": sql[:100] + "..." if sql and len(sql) > 100 else sql,
+                "columns": [],
+                "row_count": 0,
+            }
+        )
+
+    # 1. Build a textual SQL statement
+    stmt = text(sql)
+
+    # 2. Execute with bind parameters if provided
+    result = conn.execute(stmt, kwargs) if kwargs else conn.execute(stmt)
+
+    # 3. Fetch rows & column metadata
+    cursor = result.cursor  # underlying DB-API cursor
+    raw_rows = cursor.fetchall() or []
+    data = rows_to_json(cursor.description, raw_rows)
+    columns = [
+        {
+            "name": col[0],
+            "type": getattr(col[1], "__name__", str(col[1]))
+        }
+        for col in (cursor.description or [])
+    ]
+
+    # 4. Compile the statement with literal binds for “final SQL”
+    #    Fallback to DefaultDialect if conn has no `.dialect`
+    dialect = getattr(conn, "dialect", default.DefaultDialect())
+    compiled = stmt.compile(
+        dialect=dialect,
+        compile_kwargs={"literal_binds": True}
+    )
+    final_sql = str(compiled)
+
+    # 5. Build metadata using the rendered SQL
+    metadata = {
+        "tool_name": tool_name if tool_name else "base_readQuery",
+        "sql": final_sql,
+        "columns": columns,
+        "row_count": len(data),
+    }
+    logger.debug(f"Tool: handle_base_readQuery: metadata: {metadata}")
+    return create_response(data, metadata)
+
+
+#------------------ Tool  ------------------#
+# List databases tool
+def handle_base_databaseList(conn: TeradataConnection, *args, **kwargs):
+    """
+    Lists all databases in the Teradata System.
+
+    Returns:
+      ResponseType: formatted response with query results + metadata
+    """
+    logger.debug(f"Tool: handle_base_databaseList: Args: None")
+
+    sql = "select DataBaseName, DECODE(DBKind, 'U', 'User', 'D','DataBase') as DBType, CommentString from dbc.DatabasesV dv where OwnerName <> 'PDCRADM'"
+
+    with conn.cursor() as cur:
+        rows = cur.execute(sql)
+        data = rows_to_json(cur.description, rows.fetchall())
+        metadata = {
+            "tool_name": "base_databaseList",
+            "sql": sql,
+            "columns": [
+                {"name": col[0], "type": col[1].__name__ if hasattr(col[1], '__name__') else str(col[1])}
+                for col in cur.description
+            ] if cur.description else [],
+            "row_count": len(data)
+        }
+        logger.debug(f"Tool: handle_base_databaseList: metadata: {metadata}")
+        return create_response(data, metadata)
+
+
+#------------------ Tool  ------------------#
+# List tables tool
+def handle_base_tableList(conn: TeradataConnection, database_name: str | None = None, *args, **kwargs):
+    """
+    Lists all tables in a database.
+
+    Arguments:
+      database_name - Database name
+
+    Returns:
+      ResponseType: formatted response with query results + metadata
+    """
+    logger.debug(f"Tool: handle_base_tableList: Args: database_name: {database_name}")
+
+    sql = "select TableName from dbc.TablesV tv where tv.TableKind in ('T','V', 'O', 'Q')"
+    params = []
+
+    if database_name:
+        sql += " and UPPER(tv.DatabaseName) = UPPER(?)"
+        params.append(database_name)
+
+    with conn.cursor() as cur:
+        rows = cur.execute(sql, params)
+        data = rows_to_json(cur.description, rows.fetchall())
+        metadata = {
+            "tool_name": "base_tableList",
+            "sql": sql.replace("?", f"'{database_name}'"),
+            "columns": [
+                {"name": col[0], "type": col[1].__name__ if hasattr(col[1], '__name__') else str(col[1])}
+                for col in cur.description
+            ] if cur.description else [],
+            "row_count": len(data)
+        }
+        logger.debug(f"Tool: handle_base_tableList: metadata: {metadata}")
+        return create_response(data, metadata)
+
+
+#------------------ Tool  ------------------#
+# get DDL tool
+def handle_base_tableDDL(conn: TeradataConnection, database_name: str | None, table_name: str, *args, **kwargs):
+    """
+    Displays the DDL definition of a table via SQLAlchemy, bind parameters if provided (prepared SQL), and return the fully rendered SQL (with literals) in metadata.
+
+    Arguments:
+      database_name - Database name
       table_name - table name
-      no_days - number of days
 
     Returns:
       ResponseType: formatted response with query results + metadata
     """
-    logger.debug(f"Tool: handle_dba_tableSqlList: Args: table_name: {table_name}, no_days: {no_days}")
+    logger.debug(f"Tool: handle_base_tableDDL: Args: database_name: {database_name}, table_name: {table_name}")
 
+    if database_name is not None:
+        table_name = f"{database_name}.{table_name}"
     with conn.cursor() as cur:
-        if table_name == "":
-            logger.debug("No table name provided")
-        else:
-            logger.debug(f"Table name provided: {table_name}, returning SQL queries for this table.")
-            rows = cur.execute(f"""SELECT t1.QueryID, t1.ProcID, t1.CollectTimeStamp, t1.SqlTextInfo, t2.UserName
-            FROM DBC.QryLogSqlV t1
-            JOIN DBC.QryLogV t2
-            ON t1.QueryID = t2.QueryID
-            WHERE t1.CollectTimeStamp >= CURRENT_TIMESTAMP - INTERVAL '{no_days}' DAY
-            AND t1.SqlTextInfo LIKE '%{table_name}%'
-            ORDER BY t1.CollectTimeStamp DESC;""")
-
+        rows = cur.execute(f"show table {table_name}")
         data = rows_to_json(cur.description, rows.fetchall())
         metadata = {
-            "tool_name": "dba_tableSqlList",
-            "table_name": table_name,
-            "no_days": no_days,
-            "total_queries": len(data)
-        }
-        logger.debug(f"Tool: handle_dba_tableSqlList: metadata: {metadata}")
-        return create_response(data, metadata)
-
-#------------------ Tool  ------------------#
-# Get user SQL tool
-def handle_dba_userSqlList(conn: TeradataConnection, user_name: str, no_days: int | None = 7,  *args, **kwargs):
-    """
-    Get a list of SQL run by a user in the last number of days if a user name is provided, otherwise get list of all SQL in the last number of days.
-
-    Arguments:
-      user_name - user name
-      no_days - number of days
-
-    Returns:
-      ResponseType: formatted response with query results + metadata
-    """
-    logger.debug(f"Tool: handle_dba_userSqlList: Args: user_name: {user_name}")
-
-    with conn.cursor() as cur:
-        if user_name == "":
-            logger.debug("No user name provided, returning all SQL queries.")
-            rows = cur.execute(f"""SELECT t1.QueryID, t1.ProcID, t1.CollectTimeStamp, t1.SqlTextInfo, t2.UserName
-            FROM DBC.QryLogSqlV t1
-            JOIN DBC.QryLogV t2
-            ON t1.QueryID = t2.QueryID
-            WHERE t1.CollectTimeStamp >= CURRENT_TIMESTAMP - INTERVAL '{no_days}' DAY
-            ORDER BY t1.CollectTimeStamp DESC;""")
-        else:
-            logger.debug(f"User name provided: {user_name}, returning SQL queries for this user.")
-            rows = cur.execute(f"""SELECT t1.QueryID, t1.ProcID, t1.CollectTimeStamp, t1.SqlTextInfo, t2.UserName
-            FROM DBC.QryLogSqlV t1
-            JOIN DBC.QryLogV t2
-            ON t1.QueryID = t2.QueryID
-            WHERE t1.CollectTimeStamp >= CURRENT_TIMESTAMP - INTERVAL '{no_days}' DAY
-            AND t2.UserName = '{user_name}'
-            ORDER BY t1.CollectTimeStamp DESC;""")
-        data = rows_to_json(cur.description, rows.fetchall())
-        metadata = {
-            "tool_name": "dba_userSqlList",
-            "user_name": user_name,
-            "no_days": no_days,
-            "total_queries": len(data)
-        }
-        logger.debug(f"Tool: handle_dba_userSqlList: metadata: {metadata}")
-        return create_response(data, metadata)
-
-
-#------------------ Tool  ------------------#
-# Get table space tool
-def handle_dba_tableSpace(conn: TeradataConnection, database_name: str | None = None, table_name: str | None = None, *args, **kwargs):
-    """
-    Get table space used for a table if table name is provided or get table space for all tables in a database if a database name is provided."
-
-    Arguments:
-      database_name - database name
-      table_name - table name
-
-    Returns:
-      ResponseType: formatted response with query results + metadata
-    """
-    logger.debug(f"Tool: handle_dba_tableSpace: Args: database_name: {database_name}, table_name: {table_name}")
-
-    with conn.cursor() as cur:
-        if not database_name and not table_name:
-            logger.debug("No database or table name provided, returning all tables and space information.")
-            rows = cur.execute("""SELECT DatabaseName, TableName, SUM(CurrentPerm) AS CurrentPerm1, SUM(PeakPerm) as PeakPerm
-            ,CAST((100-(AVG(CURRENTPERM)/MAX(NULLIFZERO(CURRENTPERM))*100)) AS DECIMAL(5,2)) as SkewPct
-            FROM DBC.AllSpaceV
-            GROUP BY DatabaseName, TableName
-            ORDER BY CurrentPerm1 desc;""")
-        elif not database_name:
-            logger.debug(f"No database name provided, returning all space information for table: {table_name}.")
-            rows = cur.execute(f"""SELECT DatabaseName, TableName, SUM(CurrentPerm) AS CurrentPerm1, SUM(PeakPerm) as PeakPerm
-            ,CAST((100-(AVG(CURRENTPERM)/MAX(NULLIFZERO(CURRENTPERM))*100)) AS DECIMAL(5,2)) as SkewPct
-            FROM DBC.AllSpaceV
-            WHERE TableName = '{table_name}'
-            GROUP BY DatabaseName, TableName
-            ORDER BY CurrentPerm1 desc;""")
-        elif not table_name:
-            logger.debug(f"No table name provided, returning all tables and space information for database: {database_name}.")
-            rows = cur.execute(f"""SELECT TableName, SUM(CurrentPerm) AS CurrentPerm1, SUM(PeakPerm) as PeakPerm
-            ,CAST((100-(AVG(CURRENTPERM)/MAX(NULLIFZERO(CURRENTPERM))*100)) AS DECIMAL(5,2)) as SkewPct
-            FROM DBC.AllSpaceV
-            WHERE DatabaseName = '{database_name}'
-            GROUP BY TableName
-            ORDER BY CurrentPerm1 desc;""")
-        else:
-            logger.debug(f"Database name: {database_name}, Table name: {table_name}, returning space information for this table.")
-            rows = cur.execute(f"""SELECT DatabaseName, TableName, SUM(CurrentPerm) AS CurrentPerm1, SUM(PeakPerm) as PeakPerm
-            ,CAST((100-(AVG(CURRENTPERM)/MAX(NULLIFZERO(CURRENTPERM))*100)) AS DECIMAL(5,2)) as SkewPct
-            FROM DBC.AllSpaceV
-            WHERE DatabaseName = '{database_name}' AND TableName = '{table_name}'
-            GROUP BY DatabaseName, TableName
-            ORDER BY CurrentPerm1 desc;""")
-
-        data = rows_to_json(cur.description, rows.fetchall())
-        metadata = {
-            "tool_name": "dba_tableSpace",
-            "database_name": database_name,
-            "table_name": table_name,
-            "total_tables": len(data)
-        }
-        logger.debug(f"Tool: handle_dba_tableSpace: metadata: {metadata}")
-        return create_response(data, metadata)
-
-
-#------------------ Tool  ------------------#
-# Get database space tool
-def handle_dba_databaseSpace(conn: TeradataConnection, database_name: str | None | None, *args, **kwargs):
-    """
-    Get database space if database name is provided, otherwise get all databases space allocations.
-
-    Arguments:
-      database_name - database name
-
-    Returns:
-      ResponseType: formatted response with query results + metadata
-    """
-    logger.debug(f"Tool: handle_dba_databaseSpace: Args: database_name: {database_name}")
-
-    database_name_filter = f"AND objectdatabasename = '{database_name}'" if database_name else ""
-
-    with conn.cursor() as cur:
-        if not database_name:
-            logger.debug("No database name provided, returning all databases and space information.")
-            rows = cur.execute("""
-                SELECT
-                    DatabaseName,
-                    CAST(SUM(MaxPerm)/1024/1024/1024 AS DECIMAL(10,2)) AS SpaceAllocated_GB,
-                    CAST(SUM(CurrentPerm)/1024/1024/1024 AS DECIMAL(10,2)) AS SpaceUsed_GB,
-                    CAST((SUM(MaxPerm) - SUM(CurrentPerm))/1024/1024/1024 AS DECIMAL(10,2)) AS FreeSpace_GB,
-                    CAST((SUM(CurrentPerm) * 100.0 / NULLIF(SUM(MaxPerm),0)) AS DECIMAL(10,2)) AS PercentUsed
-                FROM DBC.DiskSpaceV
-                WHERE MaxPerm > 0
-                GROUP BY 1
-                ORDER BY 5 DESC;
-            """)
-        else:
-            logger.debug(f"Database name: {database_name}, returning space information for this database.")
-            rows = cur.execute(f"""
-                SELECT
-                    DatabaseName,
-                    CAST(SUM(MaxPerm)/1024/1024/1024 AS DECIMAL(10,2)) AS SpaceAllocated_GB,
-                    CAST(SUM(CurrentPerm)/1024/1024/1024 AS DECIMAL(10,2)) AS SpaceUsed_GB,
-                    CAST((SUM(MaxPerm) - SUM(CurrentPerm))/1024/1024/1024 AS DECIMAL(10,2)) AS FreeSpace_GB,
-                    CAST((SUM(CurrentPerm) * 100.0 / NULLIF(SUM(MaxPerm),0)) AS DECIMAL(10,2)) AS PercentUsed
-                FROM DBC.DiskSpaceV
-                WHERE MaxPerm > 0
-                AND DatabaseName = '{database_name}'
-                GROUP BY 1;
-            """)
-
-        data = rows_to_json(cur.description, rows.fetchall())
-        metadata = {
-            "tool_name": "dba_databaseSpace",
-            "database_name": database_name,
-            "total_databases": len(data)
-        }
-        logger.debug(f"Tool: handle_dba_databaseSpace: metadata: {metadata}")
-        return create_response(data, metadata)
-
-#------------------ Tool  ------------------#
-# Resource usage summary tool
-def handle_dba_resusageSummary(conn: TeradataConnection,
-                                 dimensions: list[str] | None = None,
-                                 user_name: str | None = None,
-                                 date:  str | None = None,
-                                 dayOfWeek:  str | None = None,
-                                 hourOfDay:  str | None = None,
-                                 *args, **kwargs):
-
-    """
-    Get the Teradata system usage summary metrics by weekday and hour for each workload type and query complexity bucket.
-
-    Arguments:
-      dimensions - list of dimensions to aggregate the resource usage summary. All dimensions are: ["LogDate", "hourOfDay", "dayOfWeek", "workloadType", "workloadComplexity", "UserName", "AppId", "StatementType"]
-      user_name - user name
-      date - Date to analyze, formatted as `YYYY-MM-DD`
-      dayOfWeek - day of the week to analyze
-      hourOfDay - hour of day to analyze
-
-    """
-    logger.debug(f"Tool: handle_dba_resusageSummary: Args: dimensions: {dimensions}")
-
-    comment="Total system resource usage summary."
-
-    # If dimensions is not None or empty, filter in the allowed dimensions
-    allowed_dimensions = ["LogDate", "hourOfDay", "dayOfWeek", "workloadType", "workloadComplexity","UserName","AppId","StatementType"]
-    unsupported_dimensions = []
-    if dimensions is not None:
-        unsupported_dimensions = [dim for dim in dimensions if dim not in allowed_dimensions]
-        dimensions = [dim for dim in dimensions if dim in allowed_dimensions]
-    else:
-        dimensions=[]
-
-
-    # Update comment string based on dimensions used and supported.
-    if dimensions:
-        comment+="Metrics aggregated by " + ", ".join(dimensions) + "."
-    if unsupported_dimensions:
-        comment+="The following dimensions are not supported and will be ignored: " + ", ".join(unsupported_dimensions) + "."
-
-    # Dynamically construct the SELECT and GROUP BY clauses based on dimensions
-    dim_string = ", ".join(dimensions)
-    group_by_clause = ("GROUP BY " if dimensions else "")+dim_string
-    dim_string += ("," if dimensions else "")
-
-    filter_clause = ""
-    filter_clause += f"AND UserName = '{user_name}' " if user_name else ""
-    filter_clause += f"AND LogDate = '{date}' " if date else ""
-    filter_clause += f"AND dayOfWeek = '{dayOfWeek}' " if dayOfWeek else ""
-    filter_clause += f"AND hourOfDay = '{hourOfDay}' " if hourOfDay else ""
-
-    query = f"""
-    SELECT
-        {dim_string}
-        COUNT(*) AS "Request Count",
-        SUM(AMPCPUTime) AS "Total AMPCPUTime",
-        SUM(TotalIOCount) AS "Total IOCount",
-        SUM(ReqIOKB) AS "Total ReqIOKB",
-        SUM(ReqPhysIO) AS "Total ReqPhysIO",
-        SUM(ReqPhysIOKB) AS "Total ReqPhysIOKB",
-        SUM(SumLogIO_GB) AS "Total ReqIO GB",
-        SUM(SumPhysIO_GB) AS "Total ReqPhysIOGB",
-        SUM(TotalServerByteCount) AS "Total Server Byte Count"
-    FROM
-        (
-            SELECT
-                CAST(QryLog.Starttime as DATE) AS LogDate,
-                EXTRACT(HOUR FROM StartTime) AS hourOfDay,
-                CASE QryCal.day_of_week
-                    WHEN 1 THEN 'Sunday'
-                    WHEN 2 THEN 'Monday'
-                    WHEN 3 THEN 'Tuesday'
-                    WHEN 4 THEN 'Wednesday'
-                    WHEN 5 THEN 'Thursday'
-                    WHEN 6 THEN 'Friday'
-                    WHEN 7 THEN 'Saturday'
-                END AS dayOfWeek,
-                QryLog.UserName,
-                QryLog.AcctString,
-                QryLog.AppID ,
-                CASE
-                    WHEN QryLog.AppID LIKE ANY('TPTLOAD%', 'TPTUPD%', 'FASTLOAD%', 'MULTLOAD%', 'EXECUTOR%', 'JDBCL%') THEN 'LOAD'
-                    WHEN QryLog.StatementType IN ('Insert', 'Update', 'Delete', 'Create Table', 'Merge Into')
-                        AND QryLog.AppID NOT LIKE ANY('TPTLOAD%', 'TPTUPD%', 'FASTLOAD%', 'MULTLOAD%', 'EXECUTOR%', 'JDBCL%') THEN 'ETL/ELT'
-                    WHEN QryLog.StatementType = 'Select' AND (AppID IN ('TPTEXP', 'FASTEXP') OR AppID LIKE 'JDBCE%') THEN 'EXPORT'
-                    WHEN QryLog.StatementType = 'Select'
-                        AND QryLog.AppID NOT LIKE ANY('TPTLOAD%', 'TPTUPD%', 'FASTLOAD%', 'MULTLOAD%', 'EXECUTOR%', 'JDBCL%') THEN 'QUERY'
-                    WHEN QryLog.StatementType IN ('Dump Database', 'Unrecognized type', 'Release Lock', 'Collect Statistics') THEN 'ADMIN'
-                    ELSE 'OTHER'
-                END AS workloadType,
-                CASE
-                    WHEN StatementType = 'Merge Into' THEN 'Ingest & Prep'
-                    WHEN StatementType = 'Select' THEN 'Answers'
-                    ELSE 'System/Procedural'
-                END AS workloadComplexity,
-                QryLog.AMPCPUTime,
-                QryLog.TotalIOCount,
-                QryLog.ReqIOKB,
-                QryLog.ReqPhysIO,
-                QryLog.ReqPhysIOKB,
-                QryLog.TotalServerByteCount,
-                (QryLog.ReqIOKB / 1024 / 1024) AS SumLogIO_GB,
-                (QryLog.ReqPhysIOKB / 1024 / 1024) AS SumPhysIO_GB
-            FROM
-                DBC.DBQLogTbl QryLog
-                INNER JOIN Sys_Calendar.CALENDAR QryCal
-                    ON QryCal.calendar_date = CAST(QryLog.Starttime as DATE)
-            WHERE
-                CAST(QryLog.Starttime as DATE) BETWEEN CURRENT_DATE - 30 AND CURRENT_DATE
-                AND StartTime IS NOT NULL
-                {filter_clause}
-        ) AS QryDetails
-        {group_by_clause}
-    """
-    logger.debug(f"Tool: handle_dba_resusageSummary: Query: {query}")
-    with conn.cursor() as cur:
-        logger.debug("Resource usage summary requested.")
-        rows = cur.execute(query)
-
-        data = rows_to_json(cur.description, rows.fetchall())
-        metadata = {
-            "tool_name": "dba_resusageSummary",
-            "total_rows": len(data) ,
-            "comment": comment,
+            "tool_name": "base_tableDDL",
+            "database": database_name,
+            "table": table_name,
             "rows": len(data)
         }
-        logger.debug(f"Tool: handle_dba_resusageSummary: metadata: {metadata}")
+        logger.debug(f"Tool: handle_base_tableDDL: metadata: {metadata}")
+        return create_response(data, metadata)
+
+#------------------ Tool  ------------------#
+# Read column description tool
+def handle_base_columnDescription(conn: TeradataConnection, database_name: str | None, obj_name: str, *args, **kwargs):
+    """
+    Shows detailed column information about a database table via SQLAlchemy, bind parameters if provided (prepared SQL), and return the fully rendered SQL (with literals) in metadata.
+
+    Arguments:
+      database_name - Database name
+      obj_name - table or view name
+
+    Returns:
+      ResponseType: formatted response with query results + metadata
+    """
+    logger.debug(f"Tool: handle_base_columnDescription: Args: database_name: {database_name}, obj_name: {obj_name}")
+
+    if len(database_name) == 0:
+        database_name = "%"
+    if len(obj_name) == 0:
+        obj_name = "%"
+    with conn.cursor() as cur:
+        query = """
+            sel TableName, ColumnName, CASE ColumnType
+                WHEN '++' THEN 'TD_ANYTYPE'
+                WHEN 'A1' THEN 'UDT'
+                WHEN 'AT' THEN 'TIME'
+                WHEN 'BF' THEN 'BYTE'
+                WHEN 'BO' THEN 'BLOB'
+                WHEN 'BV' THEN 'VARBYTE'
+                WHEN 'CF' THEN 'CHAR'
+                WHEN 'CO' THEN 'CLOB'
+                WHEN 'CV' THEN 'VARCHAR'
+                WHEN 'D' THEN  'DECIMAL'
+                WHEN 'DA' THEN 'DATE'
+                WHEN 'DH' THEN 'INTERVAL DAY TO HOUR'
+                WHEN 'DM' THEN 'INTERVAL DAY TO MINUTE'
+                WHEN 'DS' THEN 'INTERVAL DAY TO SECOND'
+                WHEN 'DY' THEN 'INTERVAL DAY'
+                WHEN 'F' THEN  'FLOAT'
+                WHEN 'HM' THEN 'INTERVAL HOUR TO MINUTE'
+                WHEN 'HR' THEN 'INTERVAL HOUR'
+                WHEN 'HS' THEN 'INTERVAL HOUR TO SECOND'
+                WHEN 'I1' THEN 'BYTEINT'
+                WHEN 'I2' THEN 'SMALLINT'
+                WHEN 'I8' THEN 'BIGINT'
+                WHEN 'I' THEN  'INTEGER'
+                WHEN 'MI' THEN 'INTERVAL MINUTE'
+                WHEN 'MO' THEN 'INTERVAL MONTH'
+                WHEN 'MS' THEN 'INTERVAL MINUTE TO SECOND'
+                WHEN 'N' THEN 'NUMBER'
+                WHEN 'PD' THEN 'PERIOD(DATE)'
+                WHEN 'PM' THEN 'PERIOD(TIMESTAMP WITH TIME ZONE)'
+                WHEN 'PS' THEN 'PERIOD(TIMESTAMP)'
+                WHEN 'PT' THEN 'PERIOD(TIME)'
+                WHEN 'PZ' THEN 'PERIOD(TIME WITH TIME ZONE)'
+                WHEN 'SC' THEN 'INTERVAL SECOND'
+                WHEN 'SZ' THEN 'TIMESTAMP WITH TIME ZONE'
+                WHEN 'TS' THEN 'TIMESTAMP'
+                WHEN 'TZ' THEN 'TIME WITH TIME ZONE'
+                WHEN 'UT' THEN 'UDT'
+                WHEN 'YM' THEN 'INTERVAL YEAR TO MONTH'
+                WHEN 'YR' THEN 'INTERVAL YEAR'
+                WHEN 'AN' THEN 'UDT'
+                WHEN 'XM' THEN 'XML'
+                WHEN 'JN' THEN 'JSON'
+                WHEN 'DT' THEN 'DATASET'
+                WHEN '??' THEN 'STGEOMETRY''ANY_TYPE'
+                END as CType
+            from DBC.ColumnsVX where upper(tableName) like upper(?) and upper(DatabaseName) like upper(?)
+        """
+        rows = cur.execute(query, [obj_name, database_name])
+        data = rows_to_json(cur.description, rows.fetchall())
+        metadata = {
+            "tool_name": "base_columnDescription",
+            "database": database_name,
+            "object": obj_name,
+            "column_count": len(data)
+        }
+        logger.debug(f"Tool: handle_base_columnDescription: metadata: {metadata}")
         return create_response(data, metadata)
 
 
 #------------------ Tool  ------------------#
-# Get table usage impact tool
-def handle_dba_tableUsageImpact(conn: TeradataConnection, database_name: str | None = None, user_name: str | None = None, *args, **kwargs):
+# Read table preview tool
+def handle_base_tablePreview(conn: TeradataConnection, table_name: str, database_name: str | None = None, *args, **kwargs):
     """
-    Measure the usage of a table and views by users, this is helpful to understand what user and tables are driving most resource usage at any point in time.
+    This function returns data sample and inferred structure from a database table or view via SQLAlchemy, bind parameters if provided (prepared SQL), and return the fully rendered SQL (with literals) in metadata.
 
     Arguments:
-      database_name - database name to analyze
-      user_name - user name to analyze
+      table_name - table or view name
+      database_name - Database name
+
+    Returns:
+      ResponseType: formatted response with query results + metadata
+    """
+    logger.debug(f"Tool: handle_base_tablePreview: Args: tablename: {table_name}, databasename: {database_name}")
+
+    if database_name is not None:
+        table_name = f"{database_name}.{table_name}"
+    with conn.cursor() as cur:
+        cur.execute(f'select top 5 * from {table_name}')
+        columns = cur.description
+        sample = rows_to_json(cur.description, cur.fetchall())
+
+        metadata = {
+            "tool_name": "base_tablePreview",
+            "database": database_name,
+            "table_name": table_name,
+            "columns": [
+                {
+                    "name": c[0],
+                    "type": c[1].__name__ if hasattr(c[1], '__name__') else str(c[1]),
+                    "length": c[3]
+                }
+                for c in columns
+            ],
+            "sample_size": len(sample)
+        }
+        logger.debug(f"Tool: handle_base_tablePreview: metadata: {metadata}")
+        return create_response(sample, metadata)
+
+#------------------ Tool  ------------------#
+# Read table affinity tool
+def handle_base_tableAffinity(conn: TeradataConnection, database_name: str, obj_name: str, *args, **kwargs):
+    """
+    Get tables commonly used together by database users, this is helpful to infer relationships between tables via SQLAlchemy, bind parameters if provided (prepared SQL), and return the fully rendered SQL (with literals) in metadata.
+
+    Arguments:
+      database_name - Database name
+      object_name - table or view name
+
+    Returns:
+      ResponseType: formatted response with query results + metadata
+    """
+    logger.debug(f"Tool: handle_base_tableAffinity: Args: database_name: {database_name}, obj_name: {obj_name}")
+    table_affiity_sql="""
+    LOCKING ROW for ACCESS
+    SELECT   TRIM(QTU2.DatabaseName)  AS "DatabaseName"
+            , TRIM(QTU2.TableName)  AS "TableName"
+            , COUNT(DISTINCT QTU1.QueryID) AS "QueryCount"
+            , (current_timestamp - min(QTU2.CollectTimeStamp)) day(4) as "FirstQueryDaysAgo"
+            , (current_timestamp - max(QTU2.CollectTimeStamp)) day(4) as "LastQueryDaysAgo"
+    FROM    (
+                        SELECT   objectdatabasename AS DatabaseName
+                            , ObjectTableName AS TableName
+                            , QueryId
+                        FROM DBC.DBQLObjTbl /* for DBC */
+                        WHERE Objecttype in ('Tab', 'Viw')
+                        AND ObjectTableName = '{table_name}'
+                        AND objectdatabasename = '{database_name}'
+                        AND ObjectTableName IS NOT NULL
+                        AND ObjectColumnName IS NULL
+                        -- AND LogDate BETWEEN '2017-01-01' AND '2017-08-01' /* uncomment for PDCR */
+                        --	AND LogDate BETWEEN current_date - 90 AND current_date - 1 /* uncomment for PDCR */
+                        GROUP BY 1,2,3
+                    ) AS QTU1
+                    INNER JOIN
+                    (
+                        SELECT   objectdatabasename AS DatabaseName
+                            , ObjectTableName AS TableName
+                            , QueryId
+                            , CollectTimeStamp
+                        FROM DBC.DBQLObjTbl /* for DBC */
+                        WHERE Objecttype in ('Tab', 'Viw')
+                        AND ObjectTableName IS NOT NULL
+                        AND ObjectColumnName IS NULL
+                        GROUP BY 1,2,3, 4
+                    ) AS QTU2
+                    ON QTU1.QueryID=QTU2.QueryID
+                    INNER JOIN DBC.DBQLogTbl QU /* uncomment for DBC */
+                    -- INNER JOIN DBC.DBQLogTbl QU /* uncomment for PDCR */
+                    ON QTU1.QueryID=QU.QueryID
+    WHERE (TRIM(QTU2.TableName) <> TRIM(QTU1.TableName) OR  TRIM(QTU2.DatabaseName) <> TRIM(QTU1.DatabaseName))
+    AND (QU.AMPCPUTime + QU.ParserCPUTime) > 0
+    GROUP BY 1,2
+    ORDER BY 3 DESC, 5 DESC
+--    having "QueryCount">10
+    ;
 
     """
-    logger.debug(f"Tool: handle_dba_tableUsageImpact: Args: database_name: {database_name}, user_name: {user_name}")
+    with conn.cursor() as cur:
+        rows = cur.execute(table_affiity_sql.format(table_name=obj_name, database_name=database_name))
+        data = rows_to_json(cur.description, rows.fetchall())
+    if len(data):
+        affinity_info=f'This data contains the list of tables most commonly queried alongside object {database_name}.{obj_name}'
+    else:
+        affinity_info=f'Object {database_name}.{obj_name} is not often queried with any other table or queried at all, try other ways to infer its relationships.'
+    metadata = {
+        "tool_name": "handle_base_tableAffinity",
+        "database": database_name,
+        "object": obj_name,
+        "table_count": len(data),
+        "comment": affinity_info
+    }
+    logger.debug(f"Tool: handle_base_tableAffinity: metadata: {metadata}")
+    return create_response(data, metadata)
+
+
+#------------------ Tool  ------------------#
+# Read table usage tool
+def handle_base_tableUsage(conn: TeradataConnection, database_name: str | None = None, *args, **kwargs):
+    """
+    Measure the usage of a table and views by users in a given schema, this is helpful to infer what database objects are most actively used or drive most value via SQLAlchemy, bind parameters if provided (prepared SQL), and return the fully rendered SQL (with literals) in metadata.
+
+    Arguments:
+      database_name - Database name
+
+    Returns:
+      ResponseType: formatted response with query results + metadata
+    """
+
+    logger.debug("Tool: handle_base_tableUsage: Args: database_name:")
     database_name_filter = f"AND objectdatabasename = '{database_name}'" if database_name else ""
-    user_name_filter = f"AND username = '{user_name}'" if user_name else ""
+
     table_usage_sql="""
     LOCKING ROW for ACCESS
     sel
     DatabaseName
     ,TableName
-    ,UserName
     ,Weight as "QueryCount"
     ,100*"Weight" / sum("Weight") over(partition by 1) PercentTotal
     ,case
@@ -367,50 +498,80 @@ def handle_dba_tableUsageImpact(conn: TeradataConnection, database_name: str | N
     (
         SELECT   TRIM(QTU1.TableName)  AS "TableName"
                 , TRIM(QTU1.DatabaseName)  AS "DatabaseName"
-                ,UserName as "UserName"
                 ,max((current_timestamp - CollectTimeStamp) day(4)) as "FirstQueryDaysAgo"
                 ,min((current_timestamp - CollectTimeStamp) day(4)) as "LastQueryDaysAgo"
                 , COUNT(DISTINCT QTU1.QueryID) as "Weight"
         FROM    (
-                    SELECT   objectdatabasename AS DatabaseName
-                        , ObjectTableName AS TableName
-                        , ob.QueryId
-                    FROM DBC.DBQLObjTbl ob /* uncomment for DBC */
-                    WHERE Objecttype in ('Tab', 'Viw')
-                    {database_name_filter}
-                    AND ObjectTableName IS NOT NULL
-                    AND ObjectColumnName IS NULL
-                    -- AND LogDate BETWEEN '2017-01-01' AND '2017-08-01' /* uncomment for PDCR */
-                    --	AND LogDate BETWEEN current_date - 90 AND current_date - 1 /* uncomment for PDCR */
-                    GROUP BY 1,2,3
+                            SELECT   objectdatabasename AS DatabaseName
+                                , ObjectTableName AS TableName
+                                , QueryId
+                            FROM DBC.DBQLObjTbl /* uncomment for DBC */
+                            WHERE Objecttype in ('Tab', 'Viw')
+                            {database_name_filter}
+                            AND ObjectTableName IS NOT NULL
+                            AND ObjectColumnName IS NULL
+                            -- AND LogDate BETWEEN '2017-01-01' AND '2017-08-01' /* uncomment for PDCR */
+                            --	AND LogDate BETWEEN current_date - 90 AND current_date - 1 /* uncomment for PDCR */
+                            GROUP BY 1,2,3
                         ) AS QTU1
         INNER JOIN DBC.DBQLogTbl QU /* uncomment for DBC */
         ON QTU1.QueryID=QU.QueryID
         AND (QU.AMPCPUTime + QU.ParserCPUTime) > 0
-        {user_name_filter}
 
-        GROUP BY 1,2, 3
+        GROUP BY 1,2
     ) a
     order by PercentTotal desc
     qualify PercentTotal>0
     ;
 
     """
-    logger.debug(f"Tool: handle_dba_tableUsageImpact: table_usage_sql: {table_usage_sql}")
+
+
     with conn.cursor() as cur:
-        logger.debug("Database version information requested.")
-        rows = cur.execute(table_usage_sql.format(database_name_filter=database_name_filter, user_name_filter=user_name_filter))
+        rows = cur.execute(table_usage_sql.format(database_name_filter=database_name_filter))
         data = rows_to_json(cur.description, rows.fetchall())
     if len(data):
         info=f'This data contains the list of tables most frequently queried objects in database schema {database_name}'
     else:
         info=f'No tables have recently been queried in the database schema {database_name}.'
     metadata = {
-        "tool_name": "handle_dba_tableUsageImpact",
+        "tool_name": "handle_base_tableUsage",
         "database": database_name,
         "table_count": len(data),
-        "comment": info,
-        "rows": len(data)
+        "comment": info
     }
-    logger.debug(f"Tool: handle_dba_tableUsageImpact: metadata: {metadata}")
+    logger.debug(f"Tool: handle_base_tableUsage: metadata: {metadata}")
     return create_response(data, metadata)
+
+#------------------ Tool  ------------------#
+# Dynamic SQL execution tool
+def util_base_dynamicQuery(conn: TeradataConnection, sql_generator: callable, *args, **kwargs):
+    """
+    This tool is used to execute dynamic SQL queries that are generated at runtime by a generator function.
+
+    Arguments:
+      sql_generator (callable) - a generator function that returns a SQL query string
+
+    Returns:
+      ResponseType: formatted response with query results + metadata
+    """
+    logger.debug(f"Tool: util_base_dynamicQuery: Args: sql: {sql_generator}")
+
+    sql = sql_generator(*args, **kwargs)
+    with conn.cursor() as cur:
+        rows = cur.execute(sql)  # type: ignore
+        if rows is None:
+            return create_response([])
+
+        data = rows_to_json(cur.description, rows.fetchall())
+        metadata = {
+            "tool_name": sql_generator.__name__,
+            "sql": sql,
+            "columns": [
+                {"name": col[0], "type": col[1].__name__ if hasattr(col[1], '__name__') else str(col[1])}
+                for col in cur.description
+            ] if cur.description else [],
+            "row_count": len(data)
+        }
+        logger.debug(f"Tool: util_base_dynamicQuery: metadata: {metadata}")
+        return create_response(data, metadata)
