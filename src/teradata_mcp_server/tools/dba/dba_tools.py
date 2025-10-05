@@ -51,6 +51,21 @@ def handle_base_readQuery(
             }
         )
 
+    # Secondary security check: Ensure this is truly a read-only operation
+    sql_upper = sql.upper().strip()
+    if not sql_upper.startswith('SELECT') and not sql_upper.startswith('WITH'):
+        logger.error(f"SECURITY VIOLATION: Non-SELECT statement attempted: {sql[:50]}...")
+        return create_response(
+            [],
+            {
+                "tool_name": tool_name if tool_name else "base_readQuery",
+                "error": "Only SELECT and WITH statements are allowed in base_readQuery",
+                "sql": sql[:100] + "..." if sql and len(sql) > 100 else sql,
+                "columns": [],
+                "row_count": 0,
+            }
+        )
+
     # 1. Build a textual SQL statement
     stmt = text(sql)
 

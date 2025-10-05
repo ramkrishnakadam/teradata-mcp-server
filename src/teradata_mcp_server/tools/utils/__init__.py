@@ -129,40 +129,74 @@ def validate_sql(sql: str) -> None:
     """
     Validate SQL query to prevent dangerous operations.
     
+    This function implements mandatory security validation that cannot be bypassed.
+    All data modification operations are strictly prohibited.
+    
     Raises:
         SQLValidationError: If the SQL contains prohibited operations
     """
     if not sql or not sql.strip():
         raise SQLValidationError("Empty SQL query not allowed")
     
-    # Convert to uppercase for case-insensitive matching
+    # Convert to uppercase for case-insensitive matching and normalize
     sql_upper = sql.upper().strip()
     sql_normalized = re.sub(r'\s+', ' ', sql_upper)  # Normalize whitespace
     
-    # Check if SQL validation is disabled via environment variable
-    if os.getenv("DISABLE_SQL_VALIDATION", "false").lower() == "true":
-        logger.warning("SQL validation is DISABLED - this is a security risk!")
-        return
+    # Log all SQL queries for security audit
+    logger.info(f"SQL Security Validation: {sql[:100]}{'...' if len(sql) > 100 else ''}")
     
-    # Define dangerous operations that should be blocked
+    # Define dangerous operations that must be blocked (NO BYPASS ALLOWED)
     dangerous_keywords = [
         'UPDATE', 'DELETE', 'INSERT', 'DROP', 'CREATE', 'ALTER', 'TRUNCATE', 
-        'MERGE', 'REPLACE', 'GRANT', 'REVOKE', 'CALL', 'EXECUTE'
+        'MERGE', 'REPLACE', 'GRANT', 'REVOKE', 'CALL', 'EXECUTE', 'UPSERT'
     ]
     
-    # Check for dangerous keywords at statement boundaries
+    # Enhanced pattern matching to catch all variations
     for keyword in dangerous_keywords:
-        # Look for keyword at start of statement or after semicolon
+        # Multiple pattern checks to prevent bypass attempts
         patterns = [
-            rf'^{keyword}\s',           # At start of query
-            rf';\s*{keyword}\s',        # After semicolon
-            rf'^{keyword}$',            # Standalone keyword
-            rf';\s*{keyword}$'          # After semicolon at end
+            rf'^{keyword}\s',                    # At start of query
+            rf';\s*{keyword}\s',                 # After semicolon  
+            rf'^{keyword}$',                     # Standalone keyword
+            rf';\s*{keyword}$',                  # After semicolon at end
+            rf'\s{keyword}\s',                   # Keyword surrounded by spaces
+            rf'^\s*{keyword}\s',                 # Keyword at start with leading spaces
+            rf'\(\s*{keyword}\s',                # Keyword after opening parenthesis
+            rf'\s{keyword}\s*\(',                # Keyword before opening parenthesis
+            rf'/\*.*\*/\s*{keyword}',            # Keyword after comment block
+            rf'{keyword}\s*/\*',                 # Keyword before comment block
         ]
         
         for pattern in patterns:
             if re.search(pattern, sql_normalized):
-                raise SQLValidationError(f"Operation '{keyword}' is not allowed for security reasons")
+                logger.error(f"SECURITY VIOLATION: Blocked '{keyword}' operation in SQL: {sql[:50]}...")
+                raise SQLValidationError(f"Operation '{keyword}' is strictly prohibited for security reasons")
+    
+    # Additional security check: scan for potential obfuscation attempts
+    suspicious_patterns = [
+        r'CHAR\(\d+\)',              # CHAR() functions that could build keywords
+        r'CHR\(\d+\)',               # CHR() functions  
+        r'CONCAT\(',                 # String concatenation
+        r'\|\|',                     # String concatenation operator
+        r'EXEC\s*\(',                # Dynamic execution
+        r'EXECUTE\s*\(',             # Dynamic execution
+    ]
+    
+    for pattern in suspicious_patterns:
+        if re.search(pattern, sql_normalized):
+            logger.warning(f"SECURITY WARNING: Suspicious pattern detected: {pattern} in SQL: {sql[:50]}...")
+    
+    # Check for SQL injection patterns
+    injection_patterns = [
+        r'UNION\s+SELECT',           # UNION-based injection
+        r';\s*SELECT',               # Statement stacking
+        r'--\s*',                    # Comment injection
+        r'/\*.*\*/',                 # Block comment injection
+    ]
+    
+    for pattern in injection_patterns:
+        if re.search(pattern, sql_normalized):
+            logger.warning(f"SECURITY WARNING: Potential SQL injection pattern: {pattern} in SQL: {sql[:50]}...")
     
     # Block SELECT * without WHERE clause to prevent full table scans
     # Allow exceptions for system tables and small utility queries
