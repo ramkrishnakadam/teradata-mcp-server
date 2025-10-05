@@ -12,6 +12,10 @@ logger = logging.getLogger("teradata_mcp_server")
 
 
 #------------------ Tool  ------------------#
+# List databases tool
+
+
+#------------------ Tool  ------------------#
 # Read query tool
 def handle_base_readQuery(
     conn: Connection,
@@ -168,8 +172,26 @@ def handle_base_tableDDL(conn: TeradataConnection, database_name: str | None, ta
 
     if database_name is not None:
         table_name = f"{database_name}.{table_name}"
+    
+    # Construct and validate the SQL query before execution
+    sql_query = f"show table {table_name}"
+    try:
+        validate_sql(sql_query)
+    except SQLValidationError as e:
+        logger.error(f"SQL validation failed: {e}")
+        return create_response(
+            [],
+            {
+                "tool_name": "base_tableDDL",
+                "error": f"SQL validation failed: {str(e)}",
+                "database": database_name,
+                "table": table_name,
+                "rows": 0,
+            }
+        )
+    
     with conn.cursor() as cur:
-        rows = cur.execute(f"show table {table_name}")
+        rows = cur.execute(sql_query)
         data = rows_to_json(cur.description, rows.fetchall())
         metadata = {
             "tool_name": "base_tableDDL",
@@ -278,8 +300,26 @@ def handle_base_tablePreview(conn: TeradataConnection, table_name: str, database
 
     if database_name is not None:
         table_name = f"{database_name}.{table_name}"
+    
+    # Construct and validate the SQL query before execution
+    sql_query = f'select top 5 * from {table_name}'
+    try:
+        validate_sql(sql_query)
+    except SQLValidationError as e:
+        logger.error(f"SQL validation failed: {e}")
+        return create_response(
+            [],
+            {
+                "tool_name": "base_tablePreview",
+                "error": f"SQL validation failed: {str(e)}",
+                "database": database_name,
+                "table_name": table_name,
+                "sample_size": 0,
+            }
+        )
+    
     with conn.cursor() as cur:
-        cur.execute(f'select top 5 * from {table_name}')
+        cur.execute(sql_query)
         columns = cur.description
         sample = rows_to_json(cur.description, cur.fetchall())
 
