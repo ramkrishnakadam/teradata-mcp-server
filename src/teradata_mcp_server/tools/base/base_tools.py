@@ -5,7 +5,7 @@ from sqlalchemy import text
 from sqlalchemy.engine import Connection, default
 from teradatasql import TeradataConnection
 
-from teradata_mcp_server.tools.utils import create_response, rows_to_json
+from teradata_mcp_server.tools.utils import create_response, rows_to_json, validate_sql, SQLValidationError
 
 logger = logging.getLogger("teradata_mcp_server")
 
@@ -28,6 +28,22 @@ def handle_base_readQuery(
       ResponseType: formatted response with query results + metadata
     """
     logger.debug(f"Tool: handle_base_readQuery: Args: sql: {sql}, args={args!r}, kwargs={kwargs!r}")
+
+    # Validate SQL for security before execution
+    try:
+        validate_sql(sql)
+    except SQLValidationError as e:
+        logger.error(f"SQL validation failed: {e}")
+        return create_response(
+            [],
+            {
+                "tool_name": tool_name if tool_name else "base_readQuery",
+                "error": f"SQL validation failed: {str(e)}",
+                "sql": sql[:100] + "..." if sql and len(sql) > 100 else sql,
+                "columns": [],
+                "row_count": 0,
+            }
+        )
 
     # 1. Build a textual SQL statement
     stmt = text(sql)
@@ -454,6 +470,23 @@ def util_base_dynamicQuery(conn: TeradataConnection, sql_generator: callable, *a
     logger.debug(f"Tool: util_base_dynamicQuery: Args: sql: {sql_generator}")
 
     sql = sql_generator(*args, **kwargs)
+    
+    # Validate SQL for security before execution
+    try:
+        validate_sql(sql)
+    except SQLValidationError as e:
+        logger.error(f"SQL validation failed: {e}")
+        return create_response(
+            [],
+            {
+                "tool_name": sql_generator.__name__,
+                "error": f"SQL validation failed: {str(e)}",
+                "sql": sql[:100] + "..." if sql and len(sql) > 100 else sql,
+                "columns": [],
+                "row_count": 0,
+            }
+        )
+    
     with conn.cursor() as cur:
         rows = cur.execute(sql)  # type: ignore
         if rows is None:
