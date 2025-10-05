@@ -60,6 +60,15 @@ def handle_base_readQuery(
             }
         )
 
+    # CRITICAL SECURITY CHECK: Final SQL interception before database execution
+    # This is the last line of defense against dangerous operations
+    sql_final_check = sql.upper().strip()
+    dangerous_final_check = ['DELETE', 'UPDATE', 'INSERT', 'DROP', 'CREATE', 'ALTER', 'TRUNCATE', 'MERGE']
+    for dangerous_op in dangerous_final_check:
+        if re.search(rf'\b{dangerous_op}\b', sql_final_check):
+            logger.critical(f"SECURITY ALERT: Dangerous operation '{dangerous_op}' blocked at final execution stage")
+            raise SQLValidationError(f"CRITICAL SECURITY: Operation '{dangerous_op}' is strictly prohibited and blocked at execution level")
+    
     # 1. Build a textual SQL statement
     stmt = text(sql)
 
